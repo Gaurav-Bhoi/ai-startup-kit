@@ -48,5 +48,11 @@ ln -sf "${CACHE_DIR}/animagine-xl-4.0-opt.safetensors" "${COMFY_MODELS_DIR}/chec
 
 echo "[startup] Models ready in ${COMFY_MODELS_DIR}/checkpoints"
 
-# Start the standard runpod comfyui handler
-exec python -u /handler.py
+# Start ComfyUI in background
+COMFY_ROOT="$(dirname "$COMFY_MODELS_DIR")"
+echo "[startup] Starting ComfyUI from: $COMFY_ROOT"
+python3 "$COMFY_ROOT/main.py" --listen 127.0.0.1 --port 8188 >/tmp/comfyui.log 2>&1 &
+
+# Start RunPod serverless handler
+exec python3 -u /runpod_handler.py
+
