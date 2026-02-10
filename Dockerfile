@@ -7,11 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   ffmpeg \
   && rm -rf /var/lib/apt/lists/*
 
-# Python deps:
-# - awscli: access B2 via S3 API
-# - accelerate/transformers: Qwen runtime
-# - qwen-vl-utils: required for Qwen-VL vision parsing
-# - bitsandbytes: 4-bit loading (important on 24GB)
+# deps for B2 access + Qwen
 RUN python3 -m pip install --no-cache-dir \
   awscli \
   requests \

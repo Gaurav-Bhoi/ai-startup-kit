@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Backblaze B2 (S3-Compatible)
+# -------- B2 S3-Compatible --------
 : "${B2_REGION:?}"
 : "${B2_MODELS_BUCKET:?}"
 : "${B2_ACCESS_KEY_ID:?}"
@@ -12,31 +12,31 @@ export AWS_SECRET_ACCESS_KEY="${B2_SECRET_ACCESS_KEY}"
 export AWS_DEFAULT_REGION="${B2_REGION}"
 export AWS_EC2_METADATA_DISABLED=true
 
-# B2 S3-Compatible endpoint
 export S3_ENDPOINT="https://s3.${B2_REGION}.backblazeb2.com"
 export B2_ENDPOINT="${S3_ENDPOINT}"
 export B2_MODELS_BUCKET="${B2_MODELS_BUCKET}"
 
-# Prefix defaults (match your current layout)
+# Prefix defaults (match your bucket)
 export SD_PREFIX="${SD_PREFIX:-models/}"
 export LLM_PREFIX="${LLM_PREFIX:-models/}"
 
-# 24GB safety
+# -------- 24GB knobs --------
 export EXCLUSIVE_GPU_MODE="${EXCLUSIVE_GPU_MODE:-1}"
 export QWEN_LOAD_4BIT="${QWEN_LOAD_4BIT:-1}"
 export QWEN_DEFAULT_MAX_NEW_TOKENS="${QWEN_DEFAULT_MAX_NEW_TOKENS:-256}"
 export QWEN_MAX_GPU_GIB="${QWEN_MAX_GPU_GIB:-22GiB}"
 export QWEN_MAX_CPU_GIB="${QWEN_MAX_CPU_GIB:-64GiB}"
+export QWEN_USE_FAST="${QWEN_USE_FAST:-0}"
 
-# Cache dirs on RunPod volume
+# -------- Cache dirs on volume --------
 export SD_CACHE_DIR="${SD_CACHE_DIR:-/runpod-volume/models/checkpoints}"
 export LLM_CACHE_DIR="${LLM_CACHE_DIR:-/runpod-volume/models/llm}"
 mkdir -p "${SD_CACHE_DIR}" "${LLM_CACHE_DIR}"
 
-# ComfyUI runtime vars
+# -------- Comfy config --------
 export COMFYUI_PORT="${COMFYUI_PORT:-8188}"
-export COMFY_LISTEN_HOST="${COMFY_LISTEN_HOST:-0.0.0.0}"   # bind here
-export COMFY_CONNECT_HOST="${COMFY_CONNECT_HOST:-127.0.0.1}" # handler connects here
+export COMFY_LISTEN_HOST="${COMFY_LISTEN_HOST:-0.0.0.0}"
+export COMFY_CONNECT_HOST="${COMFY_CONNECT_HOST:-127.0.0.1}"
 export COMFY_URL="${COMFY_URL:-http://${COMFY_CONNECT_HOST}:${COMFYUI_PORT}}"
 export COMFY_ARGS="${COMFY_ARGS:---disable-metadata}"
 export COMFY_PID_FILE="${COMFY_PID_FILE:-/tmp/comfyui.pid}"
@@ -65,13 +65,13 @@ echo "[startup] Linked cache: ${COMFY_MODELS_DIR}/checkpoints/${COMFY_CHECKPOINT
 # main.py path
 COMFY_ROOT="$(dirname "$COMFY_MODELS_DIR")"
 export COMFY_MAIN="${COMFY_ROOT}/main.py"
+
 if [ ! -f "${COMFY_MAIN}" ]; then
   echo "[startup] ERROR: COMFY_MAIN not found at ${COMFY_MAIN}"
   exit 1
 fi
 
-# Start ComfyUI and VERIFY it is ready
-mkdir -p "$(dirname "${COMFY_LOG}")"
+# Start ComfyUI in background
 python3 "${COMFY_MAIN}" --listen "${COMFY_LISTEN_HOST}" --port "${COMFYUI_PORT}" ${COMFY_ARGS} >>"${COMFY_LOG}" 2>&1 &
 COMFY_PID=$!
 echo "${COMFY_PID}" > "${COMFY_PID_FILE}"
@@ -88,7 +88,6 @@ log_path = os.environ.get("COMFY_LOG", "/tmp/comfyui.log")
 
 def pid_alive(pid: int) -> bool:
     try:
-        import signal
         os.kill(pid, 0)
         return True
     except Exception:
@@ -103,14 +102,12 @@ except Exception:
 
 t0 = time.time()
 while time.time() - t0 < timeout:
-    # if process died, fail fast
     if pid is not None and not pid_alive(pid):
-        print("[startup] ComfyUI process exited early. Last 200 log lines:")
+        print("[startup] ComfyUI exited early. Last 200 log lines:")
         try:
             with open(log_path, "r", encoding="utf-8") as f:
-                lines = f.readlines()[-200:]
-            for line in lines:
-                print(line.rstrip())
+                for line in f.readlines()[-200:]:
+                    print(line.rstrip())
         except Exception as e:
             print("[startup] Could not read log:", e)
         sys.exit(1)
@@ -122,18 +119,18 @@ while time.time() - t0 < timeout:
             sys.exit(0)
     except Exception:
         pass
+
     time.sleep(1)
 
-print("[startup] ComfyUI did not become ready in time. Last 200 log lines:")
+print("[startup] ComfyUI not ready in time. Last 200 log lines:")
 try:
     with open(log_path, "r", encoding="utf-8") as f:
-        lines = f.readlines()[-200:]
-    for line in lines:
-        print(line.rstrip())
+        for line in f.readlines()[-200:]:
+            print(line.rstrip())
 except Exception as e:
     print("[startup] Could not read log:", e)
 sys.exit(1)
 PY
 
-# Start RunPod handler
+# Start RunPod serverless handler
 exec python3 -u /runpod_handler.py
