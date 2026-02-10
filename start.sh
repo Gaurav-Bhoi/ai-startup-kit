@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# -----------------------------
 # Backblaze B2 (S3-Compatible)
-: "${B2_REGION:?}"               # e.g. eu-central-003, us-west-002, etc.
+# Put these in RunPod Endpoint -> Environment (use Secrets there)
+# -----------------------------
+: "${B2_REGION:?}"               # e.g. eu-central-003
 : "${B2_MODELS_BUCKET:?}"        # your bucket name
 : "${B2_ACCESS_KEY_ID:?}"        # KeyID
 : "${B2_SECRET_ACCESS_KEY:?}"    # applicationKey
@@ -14,19 +17,27 @@ export AWS_DEFAULT_REGION="${B2_REGION}"
 # B2 S3-Compatible endpoint
 export S3_ENDPOINT="https://s3.${B2_REGION}.backblazeb2.com"
 
-# ComfyUI connection (local)
-export COMFYUI_HOST="${COMFYUI_HOST:-127.0.0.1}"
-export COMFYUI_PORT="${COMFYUI_PORT:-8188}"
-export COMFY_URL="${COMFY_URL:-http://${COMFYUI_HOST}:${COMFYUI_PORT}}"
+# -----------------------------
+# Cache dirs on the RunPod network volume
+# -----------------------------
+export SD_CACHE_DIR="${SD_CACHE_DIR:-/runpod-volume/models/checkpoints}"
+export LLM_CACHE_DIR="${LLM_CACHE_DIR:-/runpod-volume/models/llm}"
+mkdir -p "${SD_CACHE_DIR}" "${LLM_CACHE_DIR}"
 
-# Optional: limit cache size on the network volume (0 = unlimited)
-export MAX_CACHE_GB="${MAX_CACHE_GB:-0}"
+# -----------------------------
+# Bucket prefixes (match YOUR B2 layout)
+# Your screenshot shows: bucket/models/Qwen2.5-VL-32B-Instruct/...
+# and SD like: bucket/models/realvis/RealVis...safetensors
+# -----------------------------
+export SD_PREFIX="${SD_PREFIX:-models/}"
+export LLM_PREFIX="${LLM_PREFIX:-models/}"
 
-# Persistent cache on RunPod volume
-export CACHE_DIR="${CACHE_DIR:-/runpod-volume/models/checkpoints}"
-mkdir -p "${CACHE_DIR}"
+# Optional: manifest file in bucket (recommended)
+# export MODELS_MANIFEST_KEY="models/manifest.json"
 
-# Locate ComfyUI models/checkpoints folder in the image
+# -----------------------------
+# ComfyUI location + symlink checkpoints/b2 -> SD_CACHE_DIR
+# -----------------------------
 COMFY_MODELS_DIR=""
 for p in /comfyui/ComfyUI/models /comfyui/models /workspace/ComfyUI/models /ComfyUI/models; do
   if [ -d "${p}/checkpoints" ]; then
@@ -40,15 +51,21 @@ if [ -z "${COMFY_MODELS_DIR}" ]; then
   exit 1
 fi
 
-# Single symlink: make the whole cache appear in ComfyUI as "b2/<file>"
-ln -sfn "${CACHE_DIR}" "${COMFY_MODELS_DIR}/checkpoints/b2"
-echo "[startup] Linked cache: ${COMFY_MODELS_DIR}/checkpoints/b2 -> ${CACHE_DIR}"
+ln -sfn "${SD_CACHE_DIR}" "${COMFY_MODELS_DIR}/checkpoints/b2"
+echo "[startup] Linked cache: ${COMFY_MODELS_DIR}/checkpoints/b2 -> ${SD_CACHE_DIR}"
 
-# Start ComfyUI in background
+# Tell handler where to find ComfyUI main.py (so it can start it lazily)
 COMFY_ROOT="$(dirname "$COMFY_MODELS_DIR")"
-echo "[startup] Starting ComfyUI from: $COMFY_ROOT"
-COMFY_ARGS="${COMFY_ARGS:---disable-metadata}"
-python3 "$COMFY_ROOT/main.py" --listen "${COMFYUI_HOST}" --port "${COMFYUI_PORT}" ${COMFY_ARGS} >/tmp/comfyui.log 2>&1 &
+export COMFY_MAIN="${COMFY_ROOT}/main.py"
 
-# Start RunPod serverless handler
+# ComfyUI connection (local)
+export COMFYUI_HOST="${COMFYUI_HOST:-127.0.0.1}"
+export COMFYUI_PORT="${COMFYUI_PORT:-8188}"
+export COMFY_URL="${COMFY_URL:-http://${COMFYUI_HOST}:${COMFYUI_PORT}}"
+export COMFY_ARGS="${COMFY_ARGS:---disable-metadata}"
+
+# Recommended: avoid VRAM conflicts (handler will stop comfy when loading Qwen)
+export EXCLUSIVE_GPU_MODE="${EXCLUSIVE_GPU_MODE:-1}"
+
+# Start RunPod handler (ComfyUI starts only when you call task=image)
 exec python3 -u /runpod_handler.py
