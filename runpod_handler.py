@@ -2,7 +2,6 @@ import base64
 import gc
 import json
 import os
-import signal
 import subprocess
 import time
 import uuid
@@ -11,10 +10,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 import runpod
 
+
 # -----------------------------
-# Core config
+# Basic config
 # -----------------------------
-COMFY_URL = os.environ.get("COMFY_URL", "http://127.0.0.1:8188")
+COMFYUI_HOST = os.environ.get("COMFYUI_HOST", "127.0.0.1")
+COMFYUI_PORT = os.environ.get("COMFYUI_PORT", "8188")
+COMFY_URL = os.environ.get("COMFY_URL", f"http://{COMFYUI_HOST}:{COMFYUI_PORT}")
 
 # S3-compatible config (Backblaze B2 / Cloudflare R2)
 S3_ENDPOINT = (
@@ -28,58 +30,68 @@ S3_MODELS_BUCKET = (
     or os.environ.get("R2_MODELS_BUCKET")
 )
 
-# Where SD checkpoints live in your bucket (YOUR CASE looks like: models/<something>/<file>.safetensors)
-SD_PREFIX = os.environ.get("SD_PREFIX", "models/")
-
-# Where folder-based models live in your bucket (Qwen folder in your screenshot is: models/Qwen2.5-VL-32B-Instruct/...)
+# Prefixes inside the bucket (object keys)
+# Your current layout examples:
+#   SD:   models/realvis/RealVisXL_V5.0_fp16.safetensors
+#   Qwen: models/Qwen2.5-VL-32B-Instruct/<many files>
+#
+# Keep SD_PREFIX as "models/" if you haven't separated SD checkpoints.
+# Recommended later: SD_PREFIX="models/checkpoints/"
+SD_PREFIX = os.environ.get("SD_PREFIX") or os.environ.get("CHECKPOINTS_PREFIX") or "models/"
 LLM_PREFIX = os.environ.get("LLM_PREFIX", "models/")
 
-# Local caches (persistent RunPod volume)
+# Local cache (RunPod volume)
 SD_CACHE_DIR = os.environ.get("SD_CACHE_DIR", "/runpod-volume/models/checkpoints")
 LLM_CACHE_DIR = os.environ.get("LLM_CACHE_DIR", "/runpod-volume/models/llm")
 
-# In ComfyUI, we symlink SD_CACHE_DIR into checkpoints/<COMFY_SUBDIR>
+# ComfyUI checkpoints subdir name (symlink created by start.sh)
 COMFY_SUBDIR = os.environ.get("COMFY_CHECKPOINT_SUBDIR", "b2")
 
-# Optional manifest in your bucket:
-# {
-#   "realvis": {"type":"sd", "key":"models/realvis/RealVisXL_V5.0_fp16.safetensors"},
-#   "animagine": {"type":"sd", "key":"models/animagine/animagine-xl-4.0-opt.safetensors"},
-#   "qwen32b": {"type":"qwen2_5_vl", "prefix":"models/Qwen2.5-VL-32B-Instruct/"}
-# }
-MODELS_MANIFEST_KEY = os.environ.get("MODELS_MANIFEST_KEY", "")  # e.g. "models/manifest.json"
-MODELS_MANIFEST_TTL_S = int(os.environ.get("MODELS_MANIFEST_TTL_S", "300"))
-
-# Cache list results (avoid listing bucket every request)
-LIST_CACHE_TTL_S = int(os.environ.get("LIST_CACHE_TTL_S", "300"))
-
-# ComfyUI readiness timeout (seconds)
+# Timeouts
 COMFY_READY_TIMEOUT_S = int(os.environ.get("COMFY_READY_TIMEOUT_S", "300"))
+COMFY_POLL_TIMEOUT_S = int(os.environ.get("COMFY_POLL_TIMEOUT_S", "240"))
+S3_SYNC_TIMEOUT_S = int(os.environ.get("S3_SYNC_TIMEOUT_S", str(6 * 3600)))
 
-# If you want the handler to stop ComfyUI when doing LLM inference (recommended to free VRAM)
-EXCLUSIVE_GPU_MODE = os.environ.get("EXCLUSIVE_GPU_MODE", "1") == "1"
+# 24GB safety knobs
+EXCLUSIVE_GPU_MODE = os.environ.get("EXCLUSIVE_GPU_MODE", "1") == "1"  # stop comfy when running Qwen
+QWEN_LOAD_4BIT = os.environ.get("QWEN_LOAD_4BIT", "1") == "1"
+QWEN_DEFAULT_MAX_NEW_TOKENS = int(os.environ.get("QWEN_DEFAULT_MAX_NEW_TOKENS", "256"))
+QWEN_MAX_GPU_GIB = os.environ.get("QWEN_MAX_GPU_GIB", "22GiB")  # GPU cap for device_map
+QWEN_MAX_CPU_GIB = os.environ.get("QWEN_MAX_CPU_GIB", "64GiB")  # set based on your RAM
 
-# Optional: load Qwen in 4bit (needs bitsandbytes installed; if not available, it will fallback to normal)
-QWEN_LOAD_4BIT = os.environ.get("QWEN_LOAD_4BIT", "0") == "1"
+# Optional manifest in bucket (so you can call model aliases)
+# Example:
+# {
+#   "realvis": {"type":"sd","key":"models/realvis/RealVisXL_V5.0_fp16.safetensors"},
+#   "qwen32b": {"type":"qwen2_5_vl","prefix":"models/Qwen2.5-VL-32B-Instruct/"}
+# }
+MODELS_MANIFEST_KEY = os.environ.get("MODELS_MANIFEST_KEY", "")
+MODELS_MANIFEST_TTL_S = int(os.environ.get("MODELS_MANIFEST_TTL_S", "300"))
 
 _ALLOWED_CKPT_EXT = (".safetensors", ".ckpt", ".pt", ".pth")
 
 
 # -----------------------------
-# Utilities
+# Helpers: env + aws
 # -----------------------------
 def _require_env():
     missing = []
     if not S3_ENDPOINT:
-        missing.append("B2_ENDPOINT (or S3_ENDPOINT / R2_ENDPOINT)")
+        missing.append("S3_ENDPOINT (or B2_ENDPOINT / R2_ENDPOINT)")
     if not S3_MODELS_BUCKET:
         missing.append("B2_MODELS_BUCKET (or S3_MODELS_BUCKET / R2_MODELS_BUCKET)")
     if missing:
         raise RuntimeError(f"Missing env: {', '.join(missing)}")
 
 
-def _aws(cmd: List[str]) -> Dict[str, Any]:
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+def _aws(cmd: List[str], timeout: Optional[int] = None) -> Dict[str, Any]:
+    p = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout,
+    )
     if p.returncode != 0:
         raise RuntimeError(f"AWS CLI failed: {' '.join(cmd)}\nSTDERR:\n{p.stderr}")
     out = p.stdout.strip()
@@ -131,7 +143,7 @@ def _download_file_if_missing(key: str, local_path: str, timeout_s: int = 3600):
 
         src = f"s3://{S3_MODELS_BUCKET}/{key}"
         cmd = ["aws", "s3", "cp", src, tmp_path, "--endpoint-url", S3_ENDPOINT, "--only-show-errors"]
-        _aws(cmd)
+        _aws(cmd, timeout=timeout_s)
 
         os.replace(tmp_path, local_path)
     finally:
@@ -146,10 +158,10 @@ def _download_file_if_missing(key: str, local_path: str, timeout_s: int = 3600):
             pass
 
 
-def _sync_dir_if_missing(prefix: str, local_dir: str, timeout_s: int = 6 * 3600):
+def _sync_dir_once(prefix: str, local_dir: str):
     """
-    Downloads an entire folder (S3 prefix) into local_dir via `aws s3 sync`.
-    Uses a marker file so future calls are instant.
+    Syncs an S3 prefix (folder) into local_dir exactly once per worker
+    using a marker file.
     """
     prefix = prefix.replace("\\", "/")
     if not prefix.endswith("/"):
@@ -169,12 +181,11 @@ def _sync_dir_if_missing(prefix: str, local_dir: str, timeout_s: int = 6 * 3600)
             os.close(fd)
             break
         except FileExistsError:
-            if time.time() - t0 > timeout_s:
+            if time.time() - t0 > S3_SYNC_TIMEOUT_S:
                 raise RuntimeError(f"Timed out waiting for sync lock: {lock_path}")
             time.sleep(1.0)
 
     try:
-        # Another process may have finished
         if os.path.exists(marker):
             return
 
@@ -189,12 +200,10 @@ def _sync_dir_if_missing(prefix: str, local_dir: str, timeout_s: int = 6 * 3600)
             S3_ENDPOINT,
             "--only-show-errors",
         ]
-        _aws(cmd)
+        _aws(cmd, timeout=S3_SYNC_TIMEOUT_S)
 
-        # Mark complete
         with open(marker, "w", encoding="utf-8") as f:
             f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
-
     finally:
         try:
             os.remove(lock_path)
@@ -202,67 +211,25 @@ def _sync_dir_if_missing(prefix: str, local_dir: str, timeout_s: int = 6 * 3600)
             pass
 
 
-_list_cache = {"ts": 0.0, "sd_keys": [], "llm_prefixes": []}  # type: ignore
-
-
-def list_sd_checkpoints(prefix: str) -> List[str]:
-    now = time.time()
-    if now - _list_cache["ts"] < LIST_CACHE_TTL_S and _list_cache["sd_keys"]:
-        return _list_cache["sd_keys"]
-
-    keys: List[str] = []
-    token: Optional[str] = None
-
-    while True:
-        cmd = [
-            "aws",
-            "s3api",
-            "list-objects-v2",
-            "--bucket",
-            S3_MODELS_BUCKET,
-            "--prefix",
-            prefix,
-            "--endpoint-url",
-            S3_ENDPOINT,
-            "--output",
-            "json",
-        ]
-        if token:
-            cmd += ["--continuation-token", token]
-
-        resp = _aws(cmd)
-        for obj in resp.get("Contents", []) or []:
-            k = obj.get("Key")
-            if k and k.lower().endswith(_ALLOWED_CKPT_EXT):
-                keys.append(k)
-
-        if resp.get("IsTruncated") is True and resp.get("NextContinuationToken"):
-            token = resp["NextContinuationToken"]
-        else:
-            break
-
-    _list_cache["ts"] = now
-    _list_cache["sd_keys"] = keys
-    return keys
-
-
-_manifest_cache = {"ts": 0.0, "data": None}  # type: ignore
+# -----------------------------
+# Manifest (optional)
+# -----------------------------
+_manifest_cache: Dict[str, Any] = {"ts": 0.0, "data": None}
 
 
 def load_manifest() -> Dict[str, dict]:
     if not MODELS_MANIFEST_KEY:
         return {}
-
     now = time.time()
     if _manifest_cache["data"] is not None and (now - _manifest_cache["ts"] < MODELS_MANIFEST_TTL_S):
         return _manifest_cache["data"]
 
+    os.makedirs(LLM_CACHE_DIR, exist_ok=True)
     local_manifest = os.path.join(LLM_CACHE_DIR, ".models_manifest.json")
     _download_file_if_missing(MODELS_MANIFEST_KEY, local_manifest, timeout_s=300)
 
     with open(local_manifest, "r", encoding="utf-8") as f:
         data = json.load(f)
-
     if not isinstance(data, dict):
         raise RuntimeError("Manifest must be a JSON object (dict)")
 
@@ -272,39 +239,52 @@ def load_manifest() -> Dict[str, dict]:
 
 
 # -----------------------------
-# ComfyUI process management (lazy start)
+# ComfyUI process control (PID file written by start.sh)
 # -----------------------------
-_COMFY_PROC: Optional[subprocess.Popen] = None
+PID_FILE = os.environ.get("COMFY_PID_FILE", "/tmp/comfyui.pid")
+COMFY_MAIN = os.environ.get("COMFY_MAIN", "")  # set in start.sh
+COMFY_LOG = os.environ.get("COMFY_LOG", "/tmp/comfyui.log")
+COMFY_ARGS = os.environ.get("COMFY_ARGS", "--disable-metadata")
 
 
-def _find_comfy_main_py() -> str:
-    """
-    Try to find ComfyUI main.py in common images.
-    You can override by exporting COMFY_MAIN=/path/to/main.py in start.sh.
-    """
-    if os.environ.get("COMFY_MAIN"):
-        return os.environ["COMFY_MAIN"]
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
 
-    candidates = [
-        "/comfyui/main.py",
-        "/workspace/ComfyUI/main.py",
-        "/ComfyUI/main.py",
-    ]
-    for p in candidates:
-        if os.path.isfile(p):
-            return p
 
-    # Last resort: search known roots
-    for root in ("/comfyui", "/workspace", "/"):
+def _read_pid() -> Optional[int]:
+    try:
+        with open(PID_FILE, "r", encoding="utf-8") as f:
+            return int(f.read().strip())
+    except Exception:
+        return None
+
+
+def stop_comfy_if_running():
+    pid = _read_pid()
+    if not pid or not _pid_alive(pid):
+        return
+    try:
+        os.kill(pid, 15)  # SIGTERM
+    except Exception:
+        return
+
+    # wait a bit
+    t0 = time.time()
+    while time.time() - t0 < 30:
+        if not _pid_alive(pid):
+            break
+        time.sleep(0.5)
+
+    # force kill if needed
+    if _pid_alive(pid):
         try:
-            out = subprocess.check_output(["bash", "-lc", f"ls -1 {root}/**/main.py 2>/dev/null | head -n 1"])
-            cand = out.decode("utf-8").strip()
-            if cand and os.path.isfile(cand):
-                return cand
+            os.kill(pid, 9)
         except Exception:
             pass
-
-    raise RuntimeError("Could not find ComfyUI main.py. Set COMFY_MAIN in start.sh.")
 
 
 def _wait_comfy_ready(timeout_s: int = COMFY_READY_TIMEOUT_S):
@@ -321,61 +301,35 @@ def _wait_comfy_ready(timeout_s: int = COMFY_READY_TIMEOUT_S):
 
 
 def start_comfy_if_needed():
-    global _COMFY_PROC
+    # if already running
+    pid = _read_pid()
+    if pid and _pid_alive(pid):
+        return
 
-    if _COMFY_PROC is not None:
-        if _COMFY_PROC.poll() is None:
-            return
-        _COMFY_PROC = None
+    if not COMFY_MAIN or not os.path.isfile(COMFY_MAIN):
+        raise RuntimeError("COMFY_MAIN not set or invalid. start.sh must export COMFY_MAIN.")
 
-    main_py = _find_comfy_main_py()
-    listen = os.environ.get("COMFYUI_HOST", "127.0.0.1")
-    port = os.environ.get("COMFYUI_PORT", "8188")
-    comfy_args = os.environ.get("COMFY_ARGS", "--disable-metadata")
+    os.makedirs(os.path.dirname(COMFY_LOG), exist_ok=True)
 
-    # Start in background
-    log_path = os.environ.get("COMFY_LOG", "/tmp/comfyui.log")
-    with open(log_path, "a", encoding="utf-8") as logf:
-        _COMFY_PROC = subprocess.Popen(
-            ["python3", main_py, "--listen", listen, "--port", str(port), *comfy_args.split()],
+    # start in background and write pid
+    with open(COMFY_LOG, "a", encoding="utf-8") as logf:
+        proc = subprocess.Popen(
+            ["python3", COMFY_MAIN, "--listen", COMFYUI_HOST, "--port", str(COMFYUI_PORT), *COMFY_ARGS.split()],
             stdout=logf,
             stderr=logf,
         )
+    with open(PID_FILE, "w", encoding="utf-8") as f:
+        f.write(str(proc.pid))
 
     _wait_comfy_ready()
 
 
-def stop_comfy_if_running():
-    global _COMFY_PROC
-    if _COMFY_PROC is None:
-        return
-    if _COMFY_PROC.poll() is not None:
-        _COMFY_PROC = None
-        return
-
-    try:
-        _COMFY_PROC.terminate()
-        _COMFY_PROC.wait(timeout=30)
-    except Exception:
-        try:
-            _COMFY_PROC.kill()
-        except Exception:
-            pass
-    finally:
-        _COMFY_PROC = None
-
-
 # -----------------------------
-# SD (ComfyUI) workflow
+# SD: key -> local + comfy ckpt_name
 # -----------------------------
 def _sd_key_to_local_and_ckpt_name(s3_key: str) -> Tuple[str, str]:
-    """
-    Download s3_key into SD_CACHE_DIR preserving relpath AFTER SD_PREFIX.
-    ckpt_name must match ComfyUI "checkpoints/<COMFY_SUBDIR>/..."
-    """
     if not s3_key.startswith(SD_PREFIX):
         raise ValueError(f"SD key must start with SD_PREFIX='{SD_PREFIX}' (got: {s3_key})")
-
     rel = _sanitize_relpath(s3_key[len(SD_PREFIX):])
     if not rel.lower().endswith(_ALLOWED_CKPT_EXT):
         raise ValueError(f"Unsupported checkpoint extension: {rel}")
@@ -420,7 +374,7 @@ def build_txt2img_workflow(
     }
 
 
-def _submit_and_get_png(workflow: dict, timeout_s: int = 180) -> Tuple[str, bytes]:
+def _submit_and_get_png(workflow: dict, timeout_s: int = COMFY_POLL_TIMEOUT_S) -> Tuple[str, bytes]:
     client_id = str(uuid.uuid4())
     r = requests.post(
         f"{COMFY_URL}/prompt",
@@ -444,6 +398,7 @@ def _submit_and_get_png(workflow: dict, timeout_s: int = 180) -> Tuple[str, byte
                     break
             if img0 is None:
                 raise RuntimeError(f"No images in outputs for prompt_id={prompt_id}")
+
             params = {
                 "filename": img0["filename"],
                 "subfolder": img0.get("subfolder", ""),
@@ -452,18 +407,19 @@ def _submit_and_get_png(workflow: dict, timeout_s: int = 180) -> Tuple[str, byte
             img = requests.get(f"{COMFY_URL}/view", params=params, timeout=30)
             img.raise_for_status()
             return prompt_id, img.content
+
         time.sleep(1)
 
     raise RuntimeError(f"Timed out waiting for ComfyUI output (prompt_id={prompt_id})")
 
 
 # -----------------------------
-# Qwen2.5-VL (Transformers) runtime
+# Qwen runtime (Transformers)
 # -----------------------------
-_QWEN_STATE: Dict[str, Any] = {"dir": None, "model": None, "processor": None}
+_QWEN: Dict[str, Any] = {"dir": None, "model": None, "processor": None}
 
 
-def _free_gpu_memory():
+def _free_gpu():
     try:
         import torch
         torch.cuda.empty_cache()
@@ -473,23 +429,19 @@ def _free_gpu_memory():
 
 
 def unload_qwen():
-    if _QWEN_STATE["model"] is not None:
-        _QWEN_STATE["model"] = None
-    if _QWEN_STATE["processor"] is not None:
-        _QWEN_STATE["processor"] = None
-    _QWEN_STATE["dir"] = None
-    _free_gpu_memory()
+    _QWEN["model"] = None
+    _QWEN["processor"] = None
+    _QWEN["dir"] = None
+    _free_gpu()
 
 
-def ensure_qwen_loaded(local_model_dir: str):
-    """
-    Loads Qwen2.5-VL from a LOCAL folder (downloaded from B2).
-    """
-    if _QWEN_STATE["model"] is not None and _QWEN_STATE["dir"] == local_model_dir:
+def ensure_qwen_loaded(local_dir: str):
+    if _QWEN["model"] is not None and _QWEN["dir"] == local_dir:
         return
 
     if EXCLUSIVE_GPU_MODE:
         stop_comfy_if_running()
+        _free_gpu()
 
     unload_qwen()
 
@@ -507,35 +459,32 @@ def ensure_qwen_loaded(local_model_dir: str):
                 bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
             )
         except Exception:
-            quant_config = None  # fallback to normal
+            quant_config = None
 
-    if quant_config is not None:
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            local_model_dir,
-            device_map="auto",
-            quantization_config=quant_config,
-            torch_dtype="auto",
-        )
-    else:
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            local_model_dir,
-            device_map="auto",
-            torch_dtype="auto",
-        )
+    # Memory caps help on 24GB cards (some layers may be offloaded to CPU)
+    max_memory = {0: QWEN_MAX_GPU_GIB, "cpu": QWEN_MAX_CPU_GIB}
 
-    processor = AutoProcessor.from_pretrained(local_model_dir)
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        local_dir,
+        device_map="auto",
+        max_memory=max_memory,
+        torch_dtype="auto",
+        low_cpu_mem_usage=True,
+        quantization_config=quant_config,
+    )
+    processor = AutoProcessor.from_pretrained(local_dir)
 
-    _QWEN_STATE["dir"] = local_model_dir
-    _QWEN_STATE["model"] = model
-    _QWEN_STATE["processor"] = processor
+    _QWEN["dir"] = local_dir
+    _QWEN["model"] = model
+    _QWEN["processor"] = processor
 
 
-def _normalize_qwen_messages(inp: dict) -> List[dict]:
+def _normalize_messages(inp: dict) -> List[dict]:
     """
     Accepts:
-      - inp.messages in Qwen format (role + content list)
-      - inp.messages in simple OpenAI-ish format (role + content string)
-      - OR inp.prompt (+ optional image_url/image_base64) and makes messages
+      - input.messages as OpenAI-ish [{role, content: "text"}]
+      - or Qwen-style [{role, content: [{type:'text'...},{type:'image'...}]}]
+      - or input.prompt (+ optional image_url/image_base64)
     """
     msgs = inp.get("messages")
     if isinstance(msgs, list) and msgs:
@@ -549,17 +498,14 @@ def _normalize_qwen_messages(inp: dict) -> List[dict]:
                 out.append({"role": role, "content": [{"type": "text", "text": str(content)}]})
         return out
 
-    # Build from prompt (+ optional image)
     prompt = str(inp.get("prompt") or "")
     if not prompt:
-        raise ValueError("For task=chat provide input.messages or input.prompt")
+        raise ValueError("Provide input.messages or input.prompt for task=chat")
 
     content: List[dict] = []
-
     if inp.get("image_url"):
         content.append({"type": "image", "image": str(inp["image_url"])})
     elif inp.get("image_base64"):
-        # RunPod payload limit exists; prefer image_url for large images.
         b64 = str(inp["image_base64"])
         if b64.startswith("data:"):
             b64 = b64.split(",", 1)[-1]
@@ -570,17 +516,15 @@ def _normalize_qwen_messages(inp: dict) -> List[dict]:
 
 
 def qwen_chat(inp: dict) -> Dict[str, Any]:
-    """
-    Returns: {"text": "..."}
-    """
-    from qwen_vl_utils import process_vision_info  # required by Qwen2.5-VL quickstart
+    # qwen-vl-utils is required for process_vision_info
+    from qwen_vl_utils import process_vision_info
 
-    model = _QWEN_STATE["model"]
-    processor = _QWEN_STATE["processor"]
+    model = _QWEN["model"]
+    processor = _QWEN["processor"]
     if model is None or processor is None:
-        raise RuntimeError("Qwen is not loaded")
+        raise RuntimeError("Qwen not loaded")
 
-    messages = _normalize_qwen_messages(inp)
+    messages = _normalize_messages(inp)
 
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     image_inputs, video_inputs = process_vision_info(messages)
@@ -593,7 +537,6 @@ def qwen_chat(inp: dict) -> Dict[str, Any]:
         return_tensors="pt",
     )
 
-    # move to the same device as model
     try:
         import torch
         if torch.cuda.is_available():
@@ -601,7 +544,7 @@ def qwen_chat(inp: dict) -> Dict[str, Any]:
     except Exception:
         pass
 
-    max_new_tokens = int(inp.get("max_new_tokens", 256))
+    max_new_tokens = int(inp.get("max_new_tokens", QWEN_DEFAULT_MAX_NEW_TOKENS))
     temperature = float(inp.get("temperature", 0.2))
 
     generated_ids = model.generate(
@@ -611,10 +554,7 @@ def qwen_chat(inp: dict) -> Dict[str, Any]:
         do_sample=temperature > 0,
     )
 
-    # Remove prompt tokens
-    generated_ids_trimmed = [
-        out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-    ]
+    generated_ids_trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
     out = processor.batch_decode(
         generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
     )[0]
@@ -623,94 +563,81 @@ def qwen_chat(inp: dict) -> Dict[str, Any]:
 
 
 # -----------------------------
-# Model resolution (manifest or fallback)
+# Model resolution
 # -----------------------------
-def resolve_model_spec(inp: dict) -> Dict[str, Any]:
+def resolve_spec(task: str, inp: dict) -> Dict[str, Any]:
     """
-    Returns a spec dict describing what to run.
-    Uses manifest if available. Otherwise fallback:
-      - task=image: treat inp.model as SD checkpoint path relative to SD_PREFIX (or full key)
-      - task=chat: treat inp.model as folder name relative to LLM_PREFIX (or full prefix)
+    Priority:
+      1) manifest alias (input.model matches key in manifest)
+      2) fallback:
+         - task=image: model is path relative to SD_PREFIX OR full key
+         - task=chat : model is folder relative to LLM_PREFIX OR full prefix
     """
-    task = (inp.get("task") or "").lower().strip()
-
     manifest = load_manifest()
     model_name = (inp.get("model") or "").strip()
-
     if model_name and model_name.lower() in manifest:
-        entry = manifest[model_name.lower()]
-        if not isinstance(entry, dict) or "type" not in entry:
-            raise RuntimeError(f"Manifest entry for '{model_name}' must be an object with 'type'")
-        spec = dict(entry)
+        spec = manifest[model_name.lower()]
+        if not isinstance(spec, dict) or "type" not in spec:
+            raise RuntimeError(f"Manifest entry '{model_name}' must contain 'type'")
+        spec = dict(spec)
         spec["name"] = model_name.lower()
         return spec
 
-    # Fallback (no manifest or no alias)
+    if not model_name:
+        raise ValueError("Provide input.model or configure MODELS_MANIFEST_KEY")
+
     if task == "image":
-        if not model_name:
-            raise ValueError("For task=image provide input.model (checkpoint filename/path) or use manifest alias.")
-        # Accept full key
+        # full key?
         if model_name.startswith(SD_PREFIX):
             key = model_name
         else:
-            rel = _sanitize_relpath(model_name)
-            key = f"{SD_PREFIX}{rel}"
+            key = f"{SD_PREFIX}{_sanitize_relpath(model_name)}"
         return {"type": "sd", "key": key, "name": model_name}
 
     if task == "chat":
-        if not model_name:
-            raise ValueError("For task=chat provide input.model (folder name/path) or use manifest alias.")
-        # Accept full prefix
+        # full prefix?
         if model_name.startswith(LLM_PREFIX):
             prefix = model_name
         else:
-            rel = _sanitize_relpath(model_name)
-            prefix = f"{LLM_PREFIX}{rel}"
+            prefix = f"{LLM_PREFIX}{_sanitize_relpath(model_name)}"
         if not prefix.endswith("/"):
             prefix += "/"
         return {"type": "qwen2_5_vl", "prefix": prefix, "name": model_name}
 
-    raise ValueError("Unknown task. Use input.task='image' or 'chat'.")
+    raise ValueError("task must be 'image' or 'chat'")
 
 
 # -----------------------------
-# Main handler (single endpoint router)
+# Main handler (single endpoint)
 # -----------------------------
 def handler(event: dict):
     _require_env()
+    os.makedirs(SD_CACHE_DIR, exist_ok=True)
+    os.makedirs(LLM_CACHE_DIR, exist_ok=True)
 
     inp = event.get("input", {}) or {}
 
-    # Decide task:
-    # - explicit input.task wins
-    # - else: messages => chat, otherwise image
+    # Utility actions
+    action = (inp.get("action") or "").lower().strip()
+    if action in ("manifest", "list_manifest"):
+        return {"manifest_key": MODELS_MANIFEST_KEY, "manifest": load_manifest()}
+
+    # Decide task
     task = (inp.get("task") or "").lower().strip()
     if not task:
         task = "chat" if inp.get("messages") else "image"
 
-    # Quick utility: list manifest or list SD checkpoints
-    if (inp.get("action") or "").lower() in ("list_models", "manifest"):
-        return {"manifest_key": MODELS_MANIFEST_KEY, "models": load_manifest()}
+    spec = resolve_spec(task, inp)
 
-    if (inp.get("action") or "").lower() in ("list_sd", "list_checkpoints", "list_image_models"):
-        keys = list_sd_checkpoints(prefix=SD_PREFIX)
-        short = [k[len(SD_PREFIX):] for k in keys if k.startswith(SD_PREFIX)]
-        return {"prefix": SD_PREFIX, "count": len(keys), "keys": keys, "short": short}
-
-    # Resolve model (manifest alias or fallback)
-    inp["task"] = task
-    spec = resolve_model_spec(inp)
-
-    # ------------------ IMAGE (ComfyUI) ------------------
+    # ---------------- image (SD / ComfyUI) ----------------
     if task == "image":
         if spec.get("type") != "sd":
-            raise RuntimeError(f"task=image requires type=sd, got: {spec.get('type')}")
+            raise RuntimeError(f"task=image needs type=sd, got {spec.get('type')}")
 
-        # If we were running Qwen, unload it to free VRAM
+        # If Qwen was loaded, unload to free VRAM (optional)
         if EXCLUSIVE_GPU_MODE:
             unload_qwen()
 
-        # Start ComfyUI when needed
         start_comfy_if_needed()
 
         s3_key = str(spec["key"])
@@ -724,7 +651,6 @@ def handler(event: dict):
         seed = int(inp.get("seed", int(time.time()) % 2_000_000_000))
         width = int(inp.get("width", 1024))
         height = int(inp.get("height", 1024))
-
         width = max(256, (width // 8) * 8)
         height = max(256, (height // 8) * 8)
 
@@ -744,39 +670,33 @@ def handler(event: dict):
         return {
             "task": "image",
             "prompt_id": prompt_id,
-            "model": spec.get("name"),
             "checkpoint_key": s3_key,
             "ckpt_name": ckpt_name,
             "seed": seed,
             "image_base64": base64.b64encode(png_bytes).decode("utf-8"),
         }
 
-    # ------------------ CHAT (Qwen folder) ------------------
+    # ---------------- chat (Qwen folder) ----------------
     if task == "chat":
-        if spec.get("type") not in ("qwen2_5_vl", "qwen2.5_vl", "qwen"):
-            raise RuntimeError(
-                f"task=chat currently supports type=qwen2_5_vl (set in manifest). Got: {spec.get('type')}"
-            )
+        if spec.get("type") not in ("qwen2_5_vl", "qwen", "qwen2.5_vl"):
+            raise RuntimeError(f"task=chat currently supports Qwen type, got {spec.get('type')}")
 
-        # Download folder model from B2 (prefix -> local folder)
         prefix = str(spec["prefix"])
-        # local dir name from last component of prefix
         folder_name = prefix.rstrip("/").split("/")[-1]
         local_dir = os.path.join(LLM_CACHE_DIR, folder_name)
 
-        _sync_dir_if_missing(prefix, local_dir)
+        _sync_dir_once(prefix, local_dir)
 
         ensure_qwen_loaded(local_dir)
         out = qwen_chat(inp)
 
         return {
             "task": "chat",
-            "model": spec.get("name"),
             "model_prefix": prefix,
             "text": out["text"],
         }
 
-    raise ValueError("Invalid task")
+    raise ValueError("Unknown task. Use input.task='image' or 'chat'.")
 
 
 runpod.serverless.start({"handler": handler})
