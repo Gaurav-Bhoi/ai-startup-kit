@@ -1,12 +1,17 @@
 import base64
 import gc
+import ipaddress
 import json
 import os
 import re
+import shlex
+import shutil
+import socket
 import subprocess
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import requests
 import runpod
@@ -64,8 +69,20 @@ QWEN_MAX_CPU_GIB = os.environ.get("QWEN_MAX_CPU_GIB", "64GiB")
 QWEN_USE_FAST = os.environ.get("QWEN_USE_FAST", "0") == "1"  # set 1 if you want fast processor
 
 S3_SYNC_TIMEOUT_S = int(os.environ.get("S3_SYNC_TIMEOUT_S", str(6 * 3600)))
+S3_LOCK_STALE_TIMEOUT_S = int(os.environ.get("S3_LOCK_STALE_TIMEOUT_S", str(2 * 3600)))
+MIN_FREE_DISK_GIB = float(os.environ.get("MIN_FREE_DISK_GIB", "5"))
+AWS_ERROR_MAX_CHARS = int(os.environ.get("AWS_ERROR_MAX_CHARS", "4000"))
+
+MAX_IMAGE_SIDE = int(os.environ.get("MAX_IMAGE_SIDE", "1536"))
+MAX_IMAGE_PIXELS = int(os.environ.get("MAX_IMAGE_PIXELS", str(1536 * 1024)))
+MAX_IMAGE_STEPS = int(os.environ.get("MAX_IMAGE_STEPS", "60"))
+MAX_CFG = float(os.environ.get("MAX_CFG", "20"))
+MAX_QWEN_NEW_TOKENS = int(os.environ.get("MAX_QWEN_NEW_TOKENS", "1024"))
+MAX_IMAGE_BASE64_BYTES = int(os.environ.get("MAX_IMAGE_BASE64_BYTES", str(15 * 1024 * 1024)))
+ALLOW_PRIVATE_IMAGE_URLS = os.environ.get("ALLOW_PRIVATE_IMAGE_URLS", "0") == "1"
 
 _ALLOWED_CKPT_EXT = (".safetensors", ".ckpt", ".pt", ".pth")
+_GIB = 1024 ** 3
 
 
 # =========================
@@ -81,6 +98,21 @@ def _require_env():
         raise RuntimeError(f"Missing env: {', '.join(missing)}")
 
 
+def _format_bytes(num: int) -> str:
+    value = float(max(0, num))
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024 or unit == "TiB":
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} {unit}"
+        value /= 1024
+    return f"{value:.1f} TiB"
+
+
+def _truncate(text: str, limit: int = AWS_ERROR_MAX_CHARS) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n...truncated..."
+
+
 def _aws(cmd: List[str], timeout: Optional[int] = None) -> Dict[str, Any]:
     p = subprocess.run(
         cmd,
@@ -90,7 +122,14 @@ def _aws(cmd: List[str], timeout: Optional[int] = None) -> Dict[str, Any]:
         timeout=timeout,
     )
     if p.returncode != 0:
-        raise RuntimeError(f"AWS CLI failed: {' '.join(cmd)}\nSTDERR:\n{p.stderr}")
+        stderr = _truncate(p.stderr.strip())
+        if "No space left on device" in p.stderr:
+            stderr = (
+                "No space left on the local model cache volume while downloading from object storage. "
+                "Increase the RunPod network volume, remove unused cached models, or use a smaller model.\n"
+                f"{stderr}"
+            )
+        raise RuntimeError(f"AWS CLI failed: {' '.join(cmd)}\nSTDERR:\n{stderr}")
     out = p.stdout.strip()
     if not out:
         return {}
@@ -109,50 +148,206 @@ def _sanitize_relpath(rel: str) -> str:
     return rel
 
 
-def _download_file_if_missing(key: str, local_path: str, timeout_s: int = 3600):
-    os.makedirs(os.path.dirname(local_path), exist_ok=True)
-
-    if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
-        return
-
-    lock_path = local_path + ".lock"
+def _acquire_lock(lock_path: str, timeout_s: int):
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
     t0 = time.time()
     while True:
         try:
             fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.close(fd)
-            break
-        except FileExistsError:
-            if time.time() - t0 > timeout_s:
-                raise RuntimeError(f"Timed out waiting for download lock: {lock_path}")
-            time.sleep(0.5)
-
-    tmp_path = local_path + ".part"
-    try:
-        if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"pid": os.getpid(), "created_at": time.time()}))
             return
-
-        if os.path.exists(tmp_path):
+        except FileExistsError:
             try:
-                os.remove(tmp_path)
+                age = time.time() - os.path.getmtime(lock_path)
+                if age > max(S3_LOCK_STALE_TIMEOUT_S, timeout_s + 60):
+                    os.remove(lock_path)
+                    continue
+            except FileNotFoundError:
+                continue
             except Exception:
                 pass
+
+            if time.time() - t0 > timeout_s:
+                raise RuntimeError(f"Timed out waiting for cache lock: {lock_path}")
+            time.sleep(1.0)
+
+
+def _release_lock(lock_path: str):
+    try:
+        os.remove(lock_path)
+    except FileNotFoundError:
+        pass
+
+
+def _file_complete(path: str, expected_size: Optional[int] = None) -> bool:
+    if not os.path.exists(path):
+        return False
+    size = os.path.getsize(path)
+    if expected_size is None:
+        return size > 0
+    return size == expected_size
+
+
+def _remove_if_exists(path: str):
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+def _ensure_disk_space(target_dir: str, bytes_needed: int, context: str):
+    os.makedirs(target_dir, exist_ok=True)
+    free = shutil.disk_usage(target_dir).free
+    reserve = int(MIN_FREE_DISK_GIB * _GIB)
+    required = max(0, bytes_needed) + reserve
+    if free < required:
+        raise RuntimeError(
+            "Not enough free disk space for "
+            f"{context}: need {_format_bytes(bytes_needed)} plus "
+            f"{_format_bytes(reserve)} reserve, but only {_format_bytes(free)} is free. "
+            "Increase the RunPod network volume, delete unused cached models, or choose a smaller model."
+        )
+
+
+def _head_s3_object_size(key: str) -> int:
+    resp = _aws(
+        [
+            "aws",
+            "s3api",
+            "head-object",
+            "--bucket",
+            S3_MODELS_BUCKET,
+            "--key",
+            key,
+            "--endpoint-url",
+            S3_ENDPOINT,
+            "--output",
+            "json",
+        ],
+        timeout=120,
+    )
+    return int(resp.get("ContentLength") or 0)
+
+
+def _list_s3_objects(prefix: str) -> List[Dict[str, Any]]:
+    objects: List[Dict[str, Any]] = []
+    token: Optional[str] = None
+
+    while True:
+        cmd = [
+            "aws",
+            "s3api",
+            "list-objects-v2",
+            "--bucket",
+            S3_MODELS_BUCKET,
+            "--prefix",
+            prefix,
+            "--endpoint-url",
+            S3_ENDPOINT,
+            "--output",
+            "json",
+        ]
+        if token:
+            cmd.extend(["--continuation-token", token])
+
+        resp = _aws(cmd, timeout=120)
+        for item in resp.get("Contents") or []:
+            key = str(item.get("Key") or "")
+            if not key or key.endswith("/"):
+                continue
+            objects.append({"Key": key, "Size": int(item.get("Size") or 0)})
+
+        if not resp.get("IsTruncated"):
+            break
+
+        token = resp.get("NextContinuationToken")
+        if not token:
+            raise RuntimeError(f"S3 listing for {prefix} was truncated without a continuation token")
+
+    return objects
+
+
+def _sync_manifest(objects: List[Dict[str, Any]], prefix: str) -> Dict[str, Any]:
+    return {
+        "prefix": prefix,
+        "object_count": len(objects),
+        "total_bytes": sum(int(obj["Size"]) for obj in objects),
+    }
+
+
+def _sync_marker_valid(marker_path: str, manifest: Dict[str, Any], objects: List[Dict[str, Any]], local_dir: str) -> bool:
+    try:
+        with open(marker_path, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+    except Exception:
+        return False
+
+    for key in ("prefix", "object_count", "total_bytes"):
+        if saved.get(key) != manifest.get(key):
+            return False
+
+    prefix = str(manifest["prefix"])
+    for obj in objects:
+        key = str(obj["Key"])
+        rel = _sanitize_relpath(key[len(prefix):])
+        if not rel:
+            continue
+        if not _file_complete(os.path.join(local_dir, rel), int(obj["Size"])):
+            return False
+
+    return True
+
+
+def _write_sync_marker(marker_path: str, manifest: Dict[str, Any]):
+    tmp_path = marker_path + ".part"
+    payload = {
+        **manifest,
+        "completed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, sort_keys=True)
+    os.replace(tmp_path, marker_path)
+
+
+def _download_file_if_missing(key: str, local_path: str, timeout_s: int = 3600, expected_size: Optional[int] = None):
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+
+    if expected_size is None:
+        expected_size = _head_s3_object_size(key)
+
+    if _file_complete(local_path, expected_size):
+        return
+
+    lock_path = local_path + ".lock"
+    tmp_path = local_path + ".part"
+
+    _acquire_lock(lock_path, timeout_s)
+    try:
+        if _file_complete(local_path, expected_size):
+            return
+
+        if os.path.exists(local_path) and not _file_complete(local_path, expected_size):
+            _remove_if_exists(local_path)
+        _remove_if_exists(tmp_path)
+
+        _ensure_disk_space(os.path.dirname(local_path), expected_size, key)
 
         src = f"s3://{S3_MODELS_BUCKET}/{key}"
         cmd = ["aws", "s3", "cp", src, tmp_path, "--endpoint-url", S3_ENDPOINT, "--only-show-errors"]
         _aws(cmd, timeout=timeout_s)
 
+        if not _file_complete(tmp_path, expected_size):
+            actual = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else 0
+            raise RuntimeError(
+                f"Downloaded size mismatch for {key}: expected {_format_bytes(expected_size)}, "
+                f"got {_format_bytes(actual)}"
+            )
+
         os.replace(tmp_path, local_path)
     finally:
-        try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception:
-            pass
-        try:
-            os.remove(lock_path)
-        except FileNotFoundError:
-            pass
+        _remove_if_exists(tmp_path)
+        _release_lock(lock_path)
 
 
 def _sync_dir_once(prefix: str, local_dir: str):
@@ -163,36 +358,51 @@ def _sync_dir_once(prefix: str, local_dir: str):
     os.makedirs(local_dir, exist_ok=True)
 
     marker = os.path.join(local_dir, ".sync_complete")
-    if os.path.exists(marker):
+    objects = _list_s3_objects(prefix)
+    if not objects:
+        raise RuntimeError(f"No objects found in s3://{S3_MODELS_BUCKET}/{prefix}")
+
+    manifest = _sync_manifest(objects, prefix)
+    if _sync_marker_valid(marker, manifest, objects, local_dir):
         return
 
     lock_path = os.path.join(local_dir, ".sync.lock")
-    t0 = time.time()
-    while True:
-        try:
-            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.close(fd)
-            break
-        except FileExistsError:
-            if time.time() - t0 > S3_SYNC_TIMEOUT_S:
-                raise RuntimeError(f"Timed out waiting for sync lock: {lock_path}")
-            time.sleep(1.0)
-
+    _acquire_lock(lock_path, S3_SYNC_TIMEOUT_S)
     try:
-        if os.path.exists(marker):
+        objects = _list_s3_objects(prefix)
+        manifest = _sync_manifest(objects, prefix)
+        if _sync_marker_valid(marker, manifest, objects, local_dir):
             return
 
-        src = f"s3://{S3_MODELS_BUCKET}/{prefix}"
-        cmd = ["aws", "s3", "sync", src, local_dir, "--endpoint-url", S3_ENDPOINT, "--only-show-errors"]
-        _aws(cmd, timeout=S3_SYNC_TIMEOUT_S)
+        bytes_needed = 0
+        planned: List[Tuple[str, str, int]] = []
+        for obj in objects:
+            key = str(obj["Key"])
+            if not key.startswith(prefix):
+                raise RuntimeError(f"Unexpected key outside requested prefix: {key}")
+            rel = _sanitize_relpath(key[len(prefix):])
+            if not rel:
+                continue
 
-        with open(marker, "w", encoding="utf-8") as f:
-            f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
+            local_path = os.path.join(local_dir, rel)
+            size = int(obj["Size"])
+            if _file_complete(local_path, size):
+                continue
+
+            if os.path.exists(local_path):
+                _remove_if_exists(local_path)
+            _remove_if_exists(local_path + ".part")
+            bytes_needed += size
+            planned.append((key, local_path, size))
+
+        _ensure_disk_space(local_dir, bytes_needed, f"s3://{S3_MODELS_BUCKET}/{prefix}")
+
+        for key, local_path, size in planned:
+            _download_file_if_missing(key, local_path, timeout_s=S3_SYNC_TIMEOUT_S, expected_size=size)
+
+        _write_sync_marker(marker, manifest)
     finally:
-        try:
-            os.remove(lock_path)
-        except FileNotFoundError:
-            pass
+        _release_lock(lock_path)
 
 
 # =========================
@@ -270,7 +480,7 @@ def start_comfy_if_needed():
 
     with open(COMFY_LOG, "a", encoding="utf-8") as logf:
         proc = subprocess.Popen(
-            ["python3", COMFY_MAIN, "--listen", COMFY_LISTEN_HOST, "--port", str(COMFYUI_PORT), *COMFY_ARGS.split()],
+            ["python3", COMFY_MAIN, "--listen", COMFY_LISTEN_HOST, "--port", str(COMFYUI_PORT), *shlex.split(COMFY_ARGS)],
             stdout=logf,
             stderr=logf,
         )
@@ -405,6 +615,140 @@ def unload_qwen():
     _free_gpu()
 
 
+def _clamp_int(value: Any, default: int, minimum: int, maximum: int, name: str) -> int:
+    if value is None or value == "":
+        return default
+    try:
+        parsed = int(value)
+    except Exception as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    return max(minimum, min(maximum, parsed))
+
+
+def _clamp_float(value: Any, default: float, minimum: float, maximum: float, name: str) -> float:
+    if value is None or value == "":
+        return default
+    try:
+        parsed = float(value)
+    except Exception as exc:
+        raise ValueError(f"{name} must be a number") from exc
+    return max(minimum, min(maximum, parsed))
+
+
+def _fit_image_size(width: int, height: int) -> Tuple[int, int]:
+    width = max(256, min(MAX_IMAGE_SIDE, (width // 8) * 8))
+    height = max(256, min(MAX_IMAGE_SIDE, (height // 8) * 8))
+
+    pixels = width * height
+    if pixels <= MAX_IMAGE_PIXELS:
+        return width, height
+
+    scale = (MAX_IMAGE_PIXELS / pixels) ** 0.5
+    width = max(256, (int(width * scale) // 8) * 8)
+    height = max(256, (int(height * scale) // 8) * 8)
+    return width, height
+
+
+def _host_looks_private(hostname: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(hostname)
+        return any(
+            (
+                ip.is_private,
+                ip.is_loopback,
+                ip.is_link_local,
+                ip.is_reserved,
+                ip.is_multicast,
+                ip.is_unspecified,
+            )
+        )
+    except ValueError:
+        pass
+
+    if hostname.lower() == "localhost":
+        return True
+
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except socket.gaierror as exc:
+        raise ValueError(f"Could not resolve image URL host: {hostname}") from exc
+
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if any(
+            (
+                ip.is_private,
+                ip.is_loopback,
+                ip.is_link_local,
+                ip.is_reserved,
+                ip.is_multicast,
+                ip.is_unspecified,
+            )
+        ):
+            return True
+
+    return False
+
+
+def _validate_image_url(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("image_url must use http or https")
+    if not parsed.hostname:
+        raise ValueError("image_url must include a hostname")
+    if not ALLOW_PRIVATE_IMAGE_URLS and _host_looks_private(parsed.hostname):
+        raise ValueError("image_url resolves to a private, local, or reserved address")
+    return url
+
+
+def _validate_image_data_url(value: str) -> str:
+    if value.startswith("data:"):
+        header, _, payload = value.partition(",")
+        if not header.lower().startswith("data:image/") or ";base64" not in header.lower():
+            raise ValueError("image_base64 data URL must be a base64-encoded image")
+        b64 = payload
+    else:
+        b64 = value
+
+    approx_bytes = (len(b64) * 3) // 4
+    if approx_bytes > MAX_IMAGE_BASE64_BYTES:
+        raise ValueError(
+            f"image_base64 is too large: max {_format_bytes(MAX_IMAGE_BASE64_BYTES)}, "
+            f"got about {_format_bytes(approx_bytes)}"
+        )
+
+    if value.startswith("data:"):
+        return value
+    return f"data:image/png;base64,{b64}"
+
+
+def _normalize_content_item(item: Any) -> dict:
+    if not isinstance(item, dict):
+        return {"type": "text", "text": str(item)}
+
+    item_type = item.get("type")
+    if item_type == "text":
+        return {"type": "text", "text": str(item.get("text", ""))}
+
+    if item_type in ("image", "image_url"):
+        image_value: Any = item.get("image")
+        if image_value is None:
+            image_value = item.get("image_url")
+        if isinstance(image_value, dict):
+            image_value = image_value.get("url")
+        if not image_value:
+            raise ValueError("Image content must include image or image_url")
+
+        image = str(image_value)
+        if image.startswith("data:"):
+            image = _validate_image_data_url(image)
+        else:
+            image = _validate_image_url(image)
+        return {"type": "image", "image": image}
+
+    raise ValueError(f"Unsupported message content type: {item_type}")
+
+
 def ensure_qwen_loaded(local_dir: str):
     if _QWEN["model"] is not None and _QWEN["dir"] == local_dir:
         return
@@ -454,10 +798,12 @@ def _normalize_messages(inp: dict) -> List[dict]:
     if isinstance(msgs, list) and msgs:
         out = []
         for m in msgs:
-            role = m.get("role", "user")
+            if not isinstance(m, dict):
+                raise ValueError("Each message must be an object")
+            role = str(m.get("role", "user"))
             content = m.get("content", "")
             if isinstance(content, list):
-                out.append({"role": role, "content": content})
+                out.append({"role": role, "content": [_normalize_content_item(item) for item in content]})
             else:
                 out.append({"role": role, "content": [{"type": "text", "text": str(content)}]})
         return out
@@ -468,12 +814,9 @@ def _normalize_messages(inp: dict) -> List[dict]:
 
     content: List[dict] = []
     if inp.get("image_url"):
-        content.append({"type": "image", "image": str(inp["image_url"])})
+        content.append({"type": "image", "image": _validate_image_url(str(inp["image_url"]))})
     elif inp.get("image_base64"):
-        b64 = str(inp["image_base64"])
-        if b64.startswith("data:"):
-            b64 = b64.split(",", 1)[-1]
-        content.append({"type": "image", "image": f"data:image/png;base64,{b64}"})
+        content.append({"type": "image", "image": _validate_image_data_url(str(inp["image_base64"]))})
 
     content.append({"type": "text", "text": prompt})
     return [{"role": "user", "content": content}]
@@ -508,8 +851,14 @@ def qwen_chat(inp: dict) -> Dict[str, Any]:
     except Exception:
         pass
 
-    max_new_tokens = int(inp.get("max_new_tokens", QWEN_DEFAULT_MAX_NEW_TOKENS))
-    temperature = float(inp.get("temperature", 0.2))
+    max_new_tokens = _clamp_int(
+        inp.get("max_new_tokens"),
+        QWEN_DEFAULT_MAX_NEW_TOKENS,
+        1,
+        MAX_QWEN_NEW_TOKENS,
+        "max_new_tokens",
+    )
+    temperature = _clamp_float(inp.get("temperature"), 0.2, 0.0, 2.0, "temperature")
 
     generated_ids = model.generate(
         **inputs,
@@ -579,12 +928,16 @@ def resolve_llm_prefix(model_input: str) -> str:
     if not model_input:
         raise ValueError("Provide input.model for task=chat")
 
-    # full prefix?
     if model_input.startswith(LLM_PREFIX):
-        prefix = model_input
+        rel = model_input[len(LLM_PREFIX):]
     else:
-        prefix = f"{LLM_PREFIX}{_sanitize_relpath(model_input)}"
+        rel = model_input
 
+    rel = _sanitize_relpath(rel).strip("/")
+    if not rel:
+        raise ValueError("Provide a specific chat model folder, not the whole LLM prefix")
+
+    prefix = f"{LLM_PREFIX.rstrip('/')}/{rel}"
     if not prefix.endswith("/"):
         prefix += "/"
     return prefix
@@ -607,10 +960,12 @@ def handler(event: dict):
     # --------- CHAT (QWEN) ----------
     if task == "chat":
         prefix = resolve_llm_prefix(str(inp.get("model") or ""))
-        folder_name = prefix.rstrip("/").split("/")[-1]
-        local_dir = os.path.join(LLM_CACHE_DIR, folder_name)
+        llm_base = LLM_PREFIX.rstrip("/") + "/"
+        local_rel = _sanitize_relpath(prefix[len(llm_base):].rstrip("/"))
+        local_dir = os.path.join(LLM_CACHE_DIR, local_rel)
 
-        _sync_dir_once(prefix, local_dir)
+        if _QWEN["model"] is None or _QWEN["dir"] != local_dir:
+            _sync_dir_once(prefix, local_dir)
         ensure_qwen_loaded(local_dir)
 
         out = qwen_chat(inp)
@@ -646,17 +1001,16 @@ def handler(event: dict):
 
         prompt = str(inp.get("prompt", ""))
         negative = str(inp.get("negative_prompt", ""))
-        steps = int(inp.get("steps", 30))
-        cfg = float(inp.get("cfg", 6))
-        seed = int(inp.get("seed", int(time.time()) % 2_000_000_000))
-        width = int(inp.get("width", 1024))
-        height = int(inp.get("height", 1024))
+        steps = _clamp_int(inp.get("steps"), 30, 1, MAX_IMAGE_STEPS, "steps")
+        cfg = _clamp_float(inp.get("cfg"), 6, 0.0, MAX_CFG, "cfg")
+        seed = _clamp_int(inp.get("seed"), int(time.time()) % 2_000_000_000, 0, 2_147_483_647, "seed")
+        width = _clamp_int(inp.get("width"), 1024, 256, MAX_IMAGE_SIDE, "width")
+        height = _clamp_int(inp.get("height"), 1024, 256, MAX_IMAGE_SIDE, "height")
 
         sampler_name = str(inp.get("sampler_name", "euler"))
         scheduler = str(inp.get("scheduler", "normal"))
 
-        width = max(256, (width // 8) * 8)
-        height = max(256, (height // 8) * 8)
+        width, height = _fit_image_size(width, height)
 
         workflow = build_txt2img_workflow(
             ckpt_name=ckpt_name,
@@ -678,6 +1032,8 @@ def handler(event: dict):
             "prompt_id": prompt_id,
             "checkpoint_key": sd_key,
             "ckpt_name": ckpt_name,
+            "width": width,
+            "height": height,
             "seed": seed,
             "image_base64": base64.b64encode(png_bytes).decode("utf-8"),
         }

@@ -1,20 +1,46 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# -------- B2 S3-Compatible --------
-: "${B2_REGION:?}"
-: "${B2_MODELS_BUCKET:?}"
-: "${B2_ACCESS_KEY_ID:?}"
-: "${B2_SECRET_ACCESS_KEY:?}"
+# -------- S3-Compatible object storage --------
+if [ -n "${B2_REGION:-}" ] || [ -n "${B2_ACCESS_KEY_ID:-}" ] || [ -n "${B2_SECRET_ACCESS_KEY:-}" ]; then
+  : "${B2_REGION:?}"
+  : "${B2_MODELS_BUCKET:?}"
+  : "${B2_ACCESS_KEY_ID:?}"
+  : "${B2_SECRET_ACCESS_KEY:?}"
 
-export AWS_ACCESS_KEY_ID="${B2_ACCESS_KEY_ID}"
-export AWS_SECRET_ACCESS_KEY="${B2_SECRET_ACCESS_KEY}"
-export AWS_DEFAULT_REGION="${B2_REGION}"
+  export AWS_ACCESS_KEY_ID="${B2_ACCESS_KEY_ID}"
+  export AWS_SECRET_ACCESS_KEY="${B2_SECRET_ACCESS_KEY}"
+  export AWS_DEFAULT_REGION="${B2_REGION}"
+  export S3_ENDPOINT="${S3_ENDPOINT:-https://s3.${B2_REGION}.backblazeb2.com}"
+  export S3_MODELS_BUCKET="${S3_MODELS_BUCKET:-${B2_MODELS_BUCKET}}"
+elif [ -n "${R2_ACCOUNT_ID:-}" ] || [ -n "${R2_ENDPOINT:-}" ] || [ -n "${R2_ACCESS_KEY_ID:-}" ]; then
+  : "${R2_MODELS_BUCKET:?}"
+  : "${R2_ACCESS_KEY_ID:?}"
+  : "${R2_SECRET_ACCESS_KEY:?}"
+
+  if [ -z "${R2_ENDPOINT:-}" ]; then
+    : "${R2_ACCOUNT_ID:?}"
+    export R2_ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+  fi
+
+  export AWS_ACCESS_KEY_ID="${R2_ACCESS_KEY_ID}"
+  export AWS_SECRET_ACCESS_KEY="${R2_SECRET_ACCESS_KEY}"
+  export AWS_DEFAULT_REGION="${R2_REGION:-auto}"
+  export S3_ENDPOINT="${S3_ENDPOINT:-${R2_ENDPOINT}}"
+  export S3_MODELS_BUCKET="${S3_MODELS_BUCKET:-${R2_MODELS_BUCKET}}"
+else
+  : "${S3_ENDPOINT:?}"
+  : "${S3_MODELS_BUCKET:?}"
+  : "${AWS_ACCESS_KEY_ID:?}"
+  : "${AWS_SECRET_ACCESS_KEY:?}"
+
+  export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-auto}"
+fi
+
 export AWS_EC2_METADATA_DISABLED=true
 
-export S3_ENDPOINT="https://s3.${B2_REGION}.backblazeb2.com"
-export B2_ENDPOINT="${S3_ENDPOINT}"
-export B2_MODELS_BUCKET="${B2_MODELS_BUCKET}"
+export B2_ENDPOINT="${B2_ENDPOINT:-${S3_ENDPOINT}}"
+export B2_MODELS_BUCKET="${B2_MODELS_BUCKET:-${S3_MODELS_BUCKET}}"
 
 # Prefix defaults (match your bucket)
 export SD_PREFIX="${SD_PREFIX:-models/}"
@@ -27,10 +53,16 @@ export QWEN_DEFAULT_MAX_NEW_TOKENS="${QWEN_DEFAULT_MAX_NEW_TOKENS:-256}"
 export QWEN_MAX_GPU_GIB="${QWEN_MAX_GPU_GIB:-22GiB}"
 export QWEN_MAX_CPU_GIB="${QWEN_MAX_CPU_GIB:-64GiB}"
 export QWEN_USE_FAST="${QWEN_USE_FAST:-0}"
+export MAX_QWEN_NEW_TOKENS="${MAX_QWEN_NEW_TOKENS:-1024}"
 
 # -------- Cache dirs on volume --------
 export SD_CACHE_DIR="${SD_CACHE_DIR:-/runpod-volume/models/checkpoints}"
 export LLM_CACHE_DIR="${LLM_CACHE_DIR:-/runpod-volume/models/llm}"
+export MIN_FREE_DISK_GIB="${MIN_FREE_DISK_GIB:-5}"
+export S3_LOCK_STALE_TIMEOUT_S="${S3_LOCK_STALE_TIMEOUT_S:-7200}"
+export MAX_IMAGE_SIDE="${MAX_IMAGE_SIDE:-1536}"
+export MAX_IMAGE_PIXELS="${MAX_IMAGE_PIXELS:-1572864}"
+export MAX_IMAGE_STEPS="${MAX_IMAGE_STEPS:-60}"
 mkdir -p "${SD_CACHE_DIR}" "${LLM_CACHE_DIR}"
 
 # -------- Comfy config --------
@@ -72,7 +104,8 @@ if [ ! -f "${COMFY_MAIN}" ]; then
 fi
 
 # Start ComfyUI in background
-python3 "${COMFY_MAIN}" --listen "${COMFY_LISTEN_HOST}" --port "${COMFYUI_PORT}" ${COMFY_ARGS} >>"${COMFY_LOG}" 2>&1 &
+read -r -a COMFY_ARGS_ARRAY <<< "${COMFY_ARGS}"
+python3 "${COMFY_MAIN}" --listen "${COMFY_LISTEN_HOST}" --port "${COMFYUI_PORT}" "${COMFY_ARGS_ARRAY[@]}" >>"${COMFY_LOG}" 2>&1 &
 COMFY_PID=$!
 echo "${COMFY_PID}" > "${COMFY_PID_FILE}"
 
